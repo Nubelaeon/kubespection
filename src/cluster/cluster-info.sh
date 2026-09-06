@@ -1,84 +1,114 @@
 #!/usr/bin/env bash
 
+########################################
+# cluster-info.sh
+#
+# Collects high-level cluster metrics:
+# context, Kubernetes version, node counts
+# (total/ready/not-ready), namespace count,
+# storage classes, CRDs, APIServices, and
+# Metrics Server availability.
+#
+# Runs globally at cluster scope without
+# namespace parameters.
+#
+# Output: stdout summary + JSON report
+########################################
+
 set -Eeuo pipefail
 
-readonly SCRIPT_NAME="$(basename "$0")"
-readonly TIMESTAMP="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+########################################
+# PATHS
+########################################
 
-OUTPUT_DIR="${OUTPUT_DIR:-output}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+
+source "${ROOT_DIR}/src/lib/logger.sh"
+source "${ROOT_DIR}/src/lib/validations.sh"
+source "${ROOT_DIR}/src/lib/kubectl.sh"
+source "${ROOT_DIR}/src/lib/jq.sh"
+
+register_error_trap
+
+########################################
+# CONFIG
+########################################
+
+OUTPUT_DIR="${OUTPUT_DIR:-output/cluster}"
 OUTPUT_FILE="${OUTPUT_DIR}/cluster-info.json"
 
-mkdir -p "${OUTPUT_DIR}"
+ensure_directory "${OUTPUT_DIR}"
 
-command -v kubectl >/dev/null 2>&1 || {
-  echo "kubectl not found"
-  exit 1
-}
+START_TIME="$(timer_start)"
+TIMESTAMP="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 
-command -v jq >/dev/null 2>&1 || {
-  echo "jq not found"
-  exit 1
-}
+########################################
+# PRECHECK
+########################################
 
-CURRENT_CONTEXT="$(kubectl config current-context)"
+validate_cluster_access
 
-K8S_VERSION="$(kubectl version -o json | jq -r '.serverVersion.gitVersion')"
+########################################
+# HEADER
+########################################
 
-TOTAL_NODES="$(kubectl get nodes --no-headers | wc -l | tr -d ' ')"
+print_header "Cluster Information"
+
+log_info "Collecting cluster information"
+
+########################################
+# DATA COLLECTION
+########################################
+
+CURRENT_CONTEXT="$(k_context)"
+
+K8S_VERSION="$(
+  k_version | jq_extract '.serverVersion.gitVersion'
+)"
+
+NODES_JSON="$(k_nodes)"
+
+TOTAL_NODES="$(k_node_count)"
 
 READY_NODES="$(
-kubectl get nodes \
--o json \
-| jq '[.items[]
-| select(any(.status.conditions[];
-      .type=="Ready" and .status=="True"))]
-| length'
+  echo "${NODES_JSON}" | jq_transform '.items' | jq_filter_count '
+    any(
+      .status.conditions[];
+      .type=="Ready" and .status=="True"
+    )
+  '
 )"
 
-NOT_READY_NODES="$((TOTAL_NODES-READY_NODES))"
+NOT_READY_NODES=$((TOTAL_NODES - READY_NODES))
 
-TOTAL_NAMESPACES="$(
-kubectl get ns --no-headers \
-| wc -l \
-| tr -d ' '
-)"
+TOTAL_NAMESPACES="$(k_namespace_count)"
 
-TOTAL_CRDS="$(
-kubectl get crd --no-headers 2>/dev/null \
-| wc -l \
-| tr -d ' '
-)"
+TOTAL_CRDS="$(k_crd_count)"
 
 TOTAL_APISERVICES="$(
-kubectl get apiservice --no-headers 2>/dev/null \
-| wc -l \
-| tr -d ' '
+  k_apiservices | jq_items_count
 )"
 
 STORAGE_CLASSES="$(
-kubectl get storageclass -o json \
-| jq -r '[.items[].metadata.name]'
+  k_storageclasses | jq_extract_names
 )"
 
-if kubectl top nodes >/dev/null 2>&1; then
+STORAGE_CLASSES_COUNT="$(
+  echo "${STORAGE_CLASSES}" | jq_count
+)"
+
+if k_metrics_available; then
   METRICS_SERVER=true
 else
   METRICS_SERVER=false
 fi
 
-jq -n \
-  --arg timestamp "${TIMESTAMP}" \
-  --arg context "${CURRENT_CONTEXT}" \
-  --arg version "${K8S_VERSION}" \
-  --argjson total_nodes "${TOTAL_NODES}" \
-  --argjson ready_nodes "${READY_NODES}" \
-  --argjson not_ready_nodes "${NOT_READY_NODES}" \
-  --argjson namespaces "${TOTAL_NAMESPACES}" \
-  --argjson crds "${TOTAL_CRDS}" \
-  --argjson apiservices "${TOTAL_APISERVICES}" \
-  --argjson storage_classes "${STORAGE_CLASSES}" \
-  --argjson metrics_server "${METRICS_SERVER}" \
-'
+########################################
+# JSON REPORT
+########################################
+
+jq_build_report "${OUTPUT_FILE}" '
 {
   timestamp: $timestamp,
   context: $context,
@@ -94,18 +124,44 @@ jq -n \
   apiservices: $apiservices,
   metrics_server: $metrics_server
 }
-' > "${OUTPUT_FILE}"
+' \
+  --arg timestamp "${TIMESTAMP}" \
+  --arg context "${CURRENT_CONTEXT}" \
+  --arg version "${K8S_VERSION}" \
+  --argjson total_nodes "${TOTAL_NODES}" \
+  --argjson ready_nodes "${READY_NODES}" \
+  --argjson not_ready_nodes "${NOT_READY_NODES}" \
+  --argjson namespaces "${TOTAL_NAMESPACES}" \
+  --argjson crds "${TOTAL_CRDS}" \
+  --argjson apiservices "${TOTAL_APISERVICES}" \
+  --argjson storage_classes "${STORAGE_CLASSES}" \
+  --argjson metrics_server "${METRICS_SERVER}"
+
+########################################
+# HUMAN REPORT
+########################################
+
+report_item "Context" "${CURRENT_CONTEXT}"
+report_item "Kubernetes Version" "${K8S_VERSION}"
 
 echo
-echo "Cluster Audit Summary"
-echo "====================="
-echo "Context.............: ${CURRENT_CONTEXT}"
-echo "Version.............: ${K8S_VERSION}"
-echo "Nodes...............: ${READY_NODES}/${TOTAL_NODES} Ready"
-echo "Namespaces..........: ${TOTAL_NAMESPACES}"
-echo "StorageClasses......: $(echo "${STORAGE_CLASSES}" | jq length)"
-echo "CRDs................: ${TOTAL_CRDS}"
-echo "APIServices.........: ${TOTAL_APISERVICES}"
-echo "Metrics Server......: ${METRICS_SERVER}"
+
+report_item "Total Nodes" "${TOTAL_NODES}"
+report_item "Ready Nodes" "${READY_NODES}"
+report_item "Not Ready Nodes" "${NOT_READY_NODES}"
+
 echo
-echo "JSON report: ${OUTPUT_FILE}"
+
+report_item "Namespaces" "${TOTAL_NAMESPACES}"
+report_item "Storage Classes" "${STORAGE_CLASSES_COUNT}"
+report_item "CRDs" "${TOTAL_CRDS}"
+report_item "APIServices" "${TOTAL_APISERVICES}"
+report_item "Metrics Server" "${METRICS_SERVER}"
+
+echo
+
+report_file "${OUTPUT_FILE}"
+
+report_duration "$(timer_end "${START_TIME}")"
+
+print_footer
