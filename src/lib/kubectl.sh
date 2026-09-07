@@ -420,6 +420,45 @@ k_crd_count() {
         | tr -d ' '
 }
 
+# Emit one TSV line per CRD with its addressable metadata.
+# Columns: fullname<TAB>group<TAB>plural<TAB>scope<TAB>kind
+# fullname is the "<plural>.<group>" identifier used by kubectl.
+# Carriage returns are stripped so callers can split safely on TAB
+# regardless of the platform emitting the kubectl output.
+# Usage: k_crd_specs
+k_crd_specs() {
+    kubectl get crd -o json 2>/dev/null \
+        | jq -r '
+            .items[]
+            | [
+                .metadata.name,
+                .spec.group,
+                .spec.names.plural,
+                .spec.scope,
+                .spec.names.kind
+              ]
+            | @tsv
+          ' \
+        | tr -d '\r' \
+        || true
+}
+
+# Count live instances of a custom resource across all namespaces.
+# Accepts the "<plural>.<group>" identifier. Returns 0 when the
+# resource cannot be listed (RBAC denial, stale CRD, etc.).
+# Usage: k_crd_instance_count "widgets.example.com"
+k_crd_instance_count() {
+
+    local crd_fullname="$1"
+
+    kubectl get "${crd_fullname}" \
+        --all-namespaces \
+        --no-headers \
+        2>/dev/null \
+        | wc -l \
+        | tr -d ' '
+}
+
 ########################################
 # APISERVICE
 ########################################
