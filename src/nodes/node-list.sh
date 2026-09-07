@@ -13,8 +13,19 @@
 
 set -Eeuo pipefail
 
-readonly SCRIPT_NAME="$(basename "$0")"
-readonly TIMESTAMP="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+########################################
+# PATHS
+########################################
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+
+source "${ROOT_DIR}/src/lib/logger.sh"
+source "${ROOT_DIR}/src/lib/validations.sh"
+source "${ROOT_DIR}/src/lib/kubectl.sh"
+source "${ROOT_DIR}/src/lib/jq.sh"
+
+register_error_trap
 
 ########################################
 # CONFIG
@@ -23,34 +34,37 @@ readonly TIMESTAMP="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 OUTPUT_DIR="${OUTPUT_DIR:-output/nodes}"
 OUTPUT_FILE="${OUTPUT_DIR}/node-list.json"
 
-mkdir -p "${OUTPUT_DIR}"
+ensure_directory "${OUTPUT_DIR}"
+
+START_TIME="$(timer_start)"
+TIMESTAMP="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 
 ########################################
-# VALIDATION
+# PRECHECK
 ########################################
 
-require() {
-  command -v "$1" >/dev/null 2>&1 || {
-    echo "ERROR: missing dependency: $1"
-    exit 1
-  }
-}
+validate_cluster_access
 
-require kubectl
-require jq
+########################################
+# HEADER
+########################################
+
+print_header "Node List"
+
+log_info "Collecting node information"
 
 ########################################
 # DATA COLLECTION
 ########################################
 
-CURRENT_CONTEXT="$(kubectl config current-context)"
+CURRENT_CONTEXT="$(k_context)"
 
 # Fetch all nodes in a single API call
-NODES_JSON="$(kubectl get nodes -o json)"
+NODES_JSON="$(k_nodes)"
 
 # Build structured node list via jq
 NODE_LIST="$(
-  echo "${NODES_JSON}" | jq '
+  echo "${NODES_JSON}" | jq_transform '
     [
       .items[] | {
         name: .metadata.name,
@@ -97,22 +111,22 @@ NODE_LIST="$(
   '
 )"
 
-TOTAL_NODES="$(echo "${NODE_LIST}" | jq 'length')"
+TOTAL_NODES="$(echo "${NODE_LIST}" | jq_count)"
 
 READY_NODES="$(
-  echo "${NODE_LIST}" | jq '[.[] | select(.status == "Ready")] | length'
+  echo "${NODE_LIST}" | jq_filter_count '.status == "Ready"'
 )"
 
 NOT_READY_NODES="$(
-  echo "${NODE_LIST}" | jq '[.[] | select(.status == "NotReady")] | length'
+  echo "${NODE_LIST}" | jq_filter_count '.status == "NotReady"'
 )"
 
 UNSCHEDULABLE_NODES="$(
-  echo "${NODE_LIST}" | jq '[.[] | select(.unschedulable == true)] | length'
+  echo "${NODE_LIST}" | jq_filter_count '.unschedulable == true'
 )"
 
 ########################################
-# JSON OUTPUT
+# JSON REPORT
 ########################################
 
 # Write node list to temp file to avoid "Argument list too long"
@@ -121,15 +135,7 @@ trap 'rm -f "${TMP_NODES}"' EXIT
 
 echo "${NODE_LIST}" > "${TMP_NODES}"
 
-jq -n \
-  --arg timestamp "${TIMESTAMP}" \
-  --arg context "${CURRENT_CONTEXT}" \
-  --argjson total "${TOTAL_NODES}" \
-  --argjson ready "${READY_NODES}" \
-  --argjson not_ready "${NOT_READY_NODES}" \
-  --argjson unschedulable "${UNSCHEDULABLE_NODES}" \
-  --slurpfile nodes "${TMP_NODES}" \
-'
+jq_build_report "${OUTPUT_FILE}" '
 {
   timestamp: $timestamp,
   context: $context,
@@ -141,20 +147,25 @@ jq -n \
   },
   nodes: $nodes[0]
 }
-' > "${OUTPUT_FILE}"
+' \
+  --arg timestamp "${TIMESTAMP}" \
+  --arg context "${CURRENT_CONTEXT}" \
+  --argjson total "${TOTAL_NODES}" \
+  --argjson ready "${READY_NODES}" \
+  --argjson not_ready "${NOT_READY_NODES}" \
+  --argjson unschedulable "${UNSCHEDULABLE_NODES}" \
+  --slurpfile nodes "${TMP_NODES}"
 
 ########################################
-# STDOUT SUMMARY
+# HUMAN REPORT
 ########################################
 
-echo
-echo "Node List"
-echo "========="
-echo "Context.............: ${CURRENT_CONTEXT}"
-echo "Total Nodes.........: ${TOTAL_NODES}"
-echo "Ready...............: ${READY_NODES}"
-echo "NotReady............: ${NOT_READY_NODES}"
-echo "Unschedulable.......: ${UNSCHEDULABLE_NODES}"
+report_item "Context" "${CURRENT_CONTEXT}"
+report_item "Total Nodes" "${TOTAL_NODES}"
+report_item "Ready" "${READY_NODES}"
+report_item "NotReady" "${NOT_READY_NODES}"
+report_item "Unschedulable" "${UNSCHEDULABLE_NODES}"
+
 echo
 
 # Table header
@@ -163,20 +174,24 @@ printf "%-40s %-12s %-14s %-10s %-20s\n" \
 printf "%-40s %-12s %-14s %-10s %-20s\n" \
   "----" "------" "-----" "-------" "--------"
 
-# Table rows
-echo "${NODE_LIST}" | jq -r '
-  .[] |
+# Table rows via jq_to_tsv
+echo "${NODE_LIST}" | jq_to_tsv '
   [
     .name,
     (if .unschedulable then .status + ",Sched" else .status end),
     (.roles | join(",")),
     .kubelet_version,
     .os_image
-  ] | @tsv
+  ]
 ' | while IFS=$'\t' read -r name status roles version os_image; do
   printf "%-40s %-12s %-14s %-10s %-20s\n" \
     "${name}" "${status}" "${roles}" "${version}" "${os_image}"
 done
 
 echo
-echo "JSON report: ${OUTPUT_FILE}"
+
+report_file "${OUTPUT_FILE}"
+
+report_duration "$(timer_end "${START_TIME}")"
+
+print_footer

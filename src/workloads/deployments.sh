@@ -16,30 +16,37 @@
 
 set -Eeuo pipefail
 
-readonly SCRIPT_NAME="$(basename "$0")"
-readonly TIMESTAMP="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+########################################
+# PATHS
+########################################
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+
+source "${ROOT_DIR}/src/lib/logger.sh"
+source "${ROOT_DIR}/src/lib/validations.sh"
+source "${ROOT_DIR}/src/lib/kubectl.sh"
+source "${ROOT_DIR}/src/lib/jq.sh"
+
+register_error_trap
 
 ########################################
 # CONFIG
 ########################################
 
 OUTPUT_DIR="${OUTPUT_DIR:-output/workloads}"
+OUTPUT_FILE="${OUTPUT_DIR}/deployments.json"
 
-mkdir -p "${OUTPUT_DIR}"
+ensure_directory "${OUTPUT_DIR}"
+
+START_TIME="$(timer_start)"
+TIMESTAMP="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 
 ########################################
-# VALIDATION
+# PRECHECK
 ########################################
 
-require() {
-  command -v "$1" >/dev/null 2>&1 || {
-    echo "ERROR: missing dependency: $1"
-    exit 1
-  }
-}
-
-require kubectl
-require jq
+validate_cluster_access
 
 ########################################
 # ARGUMENTS
@@ -73,16 +80,24 @@ if [[ ${#NAMESPACES[@]} -eq 0 ]]; then
 fi
 
 ########################################
+# HEADER
+########################################
+
+print_header "Deployments Audit"
+
+log_info "Inspecting deployments across ${#NAMESPACES[@]} namespace(s)"
+
+########################################
 # DATA COLLECTION
 ########################################
 
-CURRENT_CONTEXT="$(kubectl config current-context)"
+CURRENT_CONTEXT="$(k_context)"
 
 inspect_deployments() {
   local ns="$1"
 
-  kubectl get deploy -n "${ns}" -o json 2>/dev/null \
-  | jq --arg ns "${ns}" '
+  k_namespace_deployments "${ns}" \
+  | jq_transform --arg ns "${ns}" '
     [
       .items[] | {
         namespace: $ns,
@@ -127,78 +142,57 @@ inspect_deployments() {
 ALL_DEPLOYMENTS="[]"
 
 for ns in "${NAMESPACES[@]}"; do
-  echo "[INFO] inspecting deployments: ${ns}" >&2
+  log_info "inspecting deployments: ${ns}"
 
   NS_DEPLOYMENTS="$(inspect_deployments "${ns}")"
 
   # Skip empty results
-  if [[ "$(echo "${NS_DEPLOYMENTS}" | jq 'length')" -eq 0 ]]; then
+  if [[ "$(echo "${NS_DEPLOYMENTS}" | jq_count)" -eq 0 ]]; then
     continue
   fi
 
-  ALL_DEPLOYMENTS="$(
-    echo "${ALL_DEPLOYMENTS}" "${NS_DEPLOYMENTS}" \
-    | jq -s '.[0] + .[1]'
-  )"
+  ALL_DEPLOYMENTS="$(jq_merge_arrays "${ALL_DEPLOYMENTS}" "${NS_DEPLOYMENTS}")"
 done
 
 ########################################
 # SUMMARY CALCULATIONS
 ########################################
 
-TOTAL="$(echo "${ALL_DEPLOYMENTS}" | jq 'length')"
+TOTAL="$(echo "${ALL_DEPLOYMENTS}" | jq_count)"
 
 HEALTHY="$(
-  echo "${ALL_DEPLOYMENTS}" | jq '
-    [.[] | select(.replicas.desired > 0 and .replicas.ready == .replicas.desired)]
-    | length
-  '
+  echo "${ALL_DEPLOYMENTS}" | jq_filter_count \
+    '.replicas.desired > 0 and .replicas.ready == .replicas.desired'
 )"
 
 DEGRADED="$(
-  echo "${ALL_DEPLOYMENTS}" | jq '
-    [.[] | select(.replicas.desired > 0 and .replicas.ready > 0 and .replicas.ready < .replicas.desired)]
-    | length
-  '
+  echo "${ALL_DEPLOYMENTS}" | jq_filter_count \
+    '.replicas.desired > 0 and .replicas.ready > 0 and .replicas.ready < .replicas.desired'
 )"
 
 UNAVAILABLE="$(
-  echo "${ALL_DEPLOYMENTS}" | jq '
-    [.[] | select(.replicas.desired > 0 and .replicas.ready == 0)]
-    | length
-  '
+  echo "${ALL_DEPLOYMENTS}" | jq_filter_count \
+    '.replicas.desired > 0 and .replicas.ready == 0'
 )"
 
 ZERO_REPLICAS="$(
-  echo "${ALL_DEPLOYMENTS}" | jq '
-    [.[] | select(.replicas.desired == 0)]
-    | length
-  '
+  echo "${ALL_DEPLOYMENTS}" | jq_filter_count \
+    '.replicas.desired == 0'
 )"
 
 NO_REQUESTS="$(
-  echo "${ALL_DEPLOYMENTS}" | jq '
-    [.[] | select(
-      any(.containers[]; .requests.cpu == null or .requests.memory == null)
-    )]
-    | length
-  '
+  echo "${ALL_DEPLOYMENTS}" | jq_filter_count \
+    'any(.containers[]; .requests.cpu == null or .requests.memory == null)'
 )"
 
 NO_LIMITS="$(
-  echo "${ALL_DEPLOYMENTS}" | jq '
-    [.[] | select(
-      any(.containers[]; .limits.cpu == null or .limits.memory == null)
-    )]
-    | length
-  '
+  echo "${ALL_DEPLOYMENTS}" | jq_filter_count \
+    'any(.containers[]; .limits.cpu == null or .limits.memory == null)'
 )"
 
 ########################################
-# JSON OUTPUT
+# JSON REPORT
 ########################################
-
-OUTPUT_FILE="${OUTPUT_DIR}/deployments.json"
 
 # Write deployments to temp file to avoid "Argument list too long"
 readonly TMP_DEPLOYS="$(mktemp)"
@@ -206,18 +200,7 @@ trap 'rm -f "${TMP_DEPLOYS}"' EXIT
 
 echo "${ALL_DEPLOYMENTS}" > "${TMP_DEPLOYS}"
 
-jq -n \
-  --arg timestamp "${TIMESTAMP}" \
-  --arg context "${CURRENT_CONTEXT}" \
-  --argjson total "${TOTAL}" \
-  --argjson healthy "${HEALTHY}" \
-  --argjson degraded "${DEGRADED}" \
-  --argjson unavailable "${UNAVAILABLE}" \
-  --argjson zero_replicas "${ZERO_REPLICAS}" \
-  --argjson no_requests "${NO_REQUESTS}" \
-  --argjson no_limits "${NO_LIMITS}" \
-  --slurpfile deployments "${TMP_DEPLOYS}" \
-'
+jq_build_report "${OUTPUT_FILE}" '
 {
   timestamp: $timestamp,
   context: $context,
@@ -232,28 +215,36 @@ jq -n \
   },
   deployments: $deployments[0]
 }
-' > "${OUTPUT_FILE}"
+' \
+  --arg timestamp "${TIMESTAMP}" \
+  --arg context "${CURRENT_CONTEXT}" \
+  --argjson total "${TOTAL}" \
+  --argjson healthy "${HEALTHY}" \
+  --argjson degraded "${DEGRADED}" \
+  --argjson unavailable "${UNAVAILABLE}" \
+  --argjson zero_replicas "${ZERO_REPLICAS}" \
+  --argjson no_requests "${NO_REQUESTS}" \
+  --argjson no_limits "${NO_LIMITS}" \
+  --slurpfile deployments "${TMP_DEPLOYS}"
 
 ########################################
-# STDOUT SUMMARY
+# HUMAN REPORT
 ########################################
 
-echo
-echo "Deployments Audit"
-echo "================="
-echo "Context.............: ${CURRENT_CONTEXT}"
-echo "Total Deployments...: ${TOTAL}"
-echo "Healthy.............: ${HEALTHY}"
-echo "Degraded............: ${DEGRADED}"
-echo "Unavailable.........: ${UNAVAILABLE}"
-echo "Zero Replicas.......: ${ZERO_REPLICAS}"
-echo "Missing Requests....: ${NO_REQUESTS}"
-echo "Missing Limits......: ${NO_LIMITS}"
+report_item "Context" "${CURRENT_CONTEXT}"
+report_item "Total Deployments" "${TOTAL}"
+report_item "Healthy" "${HEALTHY}"
+report_item "Degraded" "${DEGRADED}"
+report_item "Unavailable" "${UNAVAILABLE}"
+report_item "Zero Replicas" "${ZERO_REPLICAS}"
+report_item "Missing Requests" "${NO_REQUESTS}"
+report_item "Missing Limits" "${NO_LIMITS}"
+
 echo
 
 # Show degraded/unavailable deployments
 if [[ "${DEGRADED}" -gt 0 ]] || [[ "${UNAVAILABLE}" -gt 0 ]]; then
-  echo "⚠ Deployments with Issues:"
+  log_warn "Deployments with Issues:"
   echo
 
   printf "  %-40s %-20s %-10s %-10s\n" \
@@ -261,11 +252,9 @@ if [[ "${DEGRADED}" -gt 0 ]] || [[ "${UNAVAILABLE}" -gt 0 ]]; then
   printf "  %-40s %-20s %-10s %-10s\n" \
     "----" "---------" "-----" "-------"
 
-  echo "${ALL_DEPLOYMENTS}" | jq -r '
-    .[]
-    | select(.replicas.desired > 0 and .replicas.ready < .replicas.desired)
+  echo "${ALL_DEPLOYMENTS}" | jq_to_tsv '
+    select(.replicas.desired > 0 and .replicas.ready < .replicas.desired)
     | [.name, .namespace, (.replicas.ready | tostring), (.replicas.desired | tostring)]
-    | @tsv
   ' | while IFS=$'\t' read -r name namespace ready desired; do
     printf "  %-40s %-20s %-10s %-10s\n" \
       "${name}" "${namespace}" "${ready}" "${desired}"
@@ -274,4 +263,8 @@ if [[ "${DEGRADED}" -gt 0 ]] || [[ "${UNAVAILABLE}" -gt 0 ]]; then
   echo
 fi
 
-echo "JSON report: ${OUTPUT_FILE}"
+report_file "${OUTPUT_FILE}"
+
+report_duration "$(timer_end "${START_TIME}")"
+
+print_footer
