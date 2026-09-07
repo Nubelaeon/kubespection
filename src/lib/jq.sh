@@ -38,6 +38,26 @@ jq_filter_count() {
   jq "[.[] | select(${filter_expr})] | length"
 }
 
+# Filter .items[] from kubectl JSON by a jq expression and count results
+# Usage: echo "$kubectl_json" | jq_items_filter_count '.status.phase=="Pending"'
+jq_items_filter_count() {
+  local filter_expr="$1"
+
+  jq "[.items[] | select(${filter_expr})] | length"
+}
+
+########################################
+# AGGREGATION
+########################################
+
+# Sum a numeric expression across .items[] from kubectl JSON
+# Usage: echo "$kubectl_json" | jq_items_sum '.status.capacity.cpu | tonumber'
+jq_items_sum() {
+  local expr="$1"
+
+  jq "[.items[] | ${expr}] | add"
+}
+
 ########################################
 # MERGE
 ########################################
